@@ -1,8 +1,11 @@
 import json
 import requests
 import openai
-import time
-import re
+from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from middlewares import add_essentials
+import uvicorn
 
 # ============================================================
 #  تنظیمات ربات بله
@@ -21,7 +24,7 @@ TEMPERATURE = 0.3
 MAX_TOKENS = 500
 TOP_P = 0.9
 
-# دستورالعمل سیستم به انگلیسی (پاسخ‌ها فقط انگلیسی)
+# SYSTEM PROMPT (English only)
 SYSTEM_PROMPT = (
     "You are an AI assistant that responds **only in English**. "
     "Do not use Persian, Arabic, Hindi, or any other language under any circumstances. "
@@ -38,52 +41,48 @@ client = openai.OpenAI(
 conversation_histories = {}
 
 # ============================================================
-#  توابع کمکی
+#  ساخت اپلیکیشن FastAPI
 # ============================================================
+app = FastAPI(title="Bale Bot + AI API", version="1.0.0")
 
-def clean_text(text: str) -> str:
-    """
-    پاکسازی متن: تبدیل حروف عربی به فارسی (در صورت نیاز) و حذف فاصله‌های اضافی
-    (حروف انگلیسی نگهداری می‌شوند)
-    """
-    # تبدیل حروف عربی به فارسی (اختیاری)
-    arabic_to_persian = {
-        'ي': 'ی',
-        'ك': 'ک',
-        'ة': 'ه',
-        '‍': '',
-    }
-    for ar, fa in arabic_to_persian.items():
-        text = text.replace(ar, fa)
-    # حذف فاصله‌های اضافی (بیش از یک فاصله)
-    text = re.sub(r'\s+', ' ', text).strip()
-    return text
+origins = ["*"]
 
-def get_last_update():
-    method = "getUpdates"
-    url = f"{BASE_URL}/{method}"
-    params = {"limit": 100, "timeout": 5}
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# ============================================================
+#  Bale Robot Methods
+# ============================================================
+def get_ai_response(messages: list) -> str:
+    """ارسال پیام‌ها به اولاما و دریافت پاسخ (بدون استریم)"""
     try:
-        resp = requests.get(url, params=params, timeout=10)
-    except requests.exceptions.RequestException as e:
-        print(f"❌ Error connecting to Bale: {e}")
-        return None, None, None, None, None
-    if resp.status_code != 200:
-        print(f"❌ Error receiving messages: {resp.status_code}")
-        return None, None, None, None, None
-    data = resp.json()
-    results = data.get('result', [])
-    if not results:
-        return None, None, None, None, None
-    last_update = results[-1]
-    update_id = last_update.get('update_id')
-    message = last_update.get('message', {})
-    chat_id = message.get('chat', {}).get('id')
-    text = message.get('text')
-    username = message.get('from', {}).get('username')
-    return update_id, chat_id, text, username, results
+        response = client.chat.completions.create(
+            model=MODEL_NAME,
+            messages=messages,
+            temperature=TEMPERATURE,
+            max_tokens=MAX_TOKENS,
+            top_p=TOP_P,
+            stream=False,
+            timeout=30.0,
+        )
+        reply = response.choices[0].message.content
+        return reply if reply else "No response received."
+    except openai.APIConnectionError:
+        return "❌ Error: Could not connect to Ollama server."
+    except openai.APITimeoutError:
+        return "❌ Error: Request timed out."
+    except Exception as e:
+        return f"❌ Unknown error: {e}"
+
 
 def send_message_to_user(chat_id, reply_text):
+    """ارسال پیام به کاربر در بله"""
     method = "sendMessage"
     url = f"{BASE_URL}/{method}"
     max_len = 4000
@@ -106,87 +105,49 @@ def send_message_to_user(chat_id, reply_text):
             success = False
     return success
 
-def confirm_updates(all_updates):
-    if not all_updates:
-        return
-    max_id = max([u.get('update_id') for u in all_updates if u.get('update_id') is not None])
-    method = "getUpdates"
-    url = f"{BASE_URL}/{method}"
-    params = {"offset": max_id + 1, "limit": 0}
-    try:
-        requests.get(url, params=params, timeout=5)
-    except requests.exceptions.RequestException:
-        pass
-
-def send_prompt_stream(messages: list):
-    try:
-        stream = client.chat.completions.create(
-            model=MODEL_NAME,
-            messages=messages,
-            temperature=TEMPERATURE,
-            max_tokens=MAX_TOKENS,
-            top_p=TOP_P,
-            stream=True,
-            timeout=30.0,
-        )
-        for chunk in stream:
-            if chunk.choices and chunk.choices[0].delta.content is not None:
-                yield chunk.choices[0].delta.content
-    except openai.APIConnectionError:
-        yield "❌ Error: Could not connect to Ollama server."
-    except openai.APITimeoutError:
-        yield "❌ Error: Request timed out."
-    except Exception as e:
-        yield f"❌ Unknown error: {e}"
-
-def get_full_response(messages: list) -> str:
-    full_response = ""
-    for chunk in send_prompt_stream(messages):
-        full_response += chunk
-        if len(full_response) > 3000:
-            full_response += "\n... [continued in next message]"
-            break
-    if full_response.strip():
-        full_response = clean_text(full_response)
-    else:
-        full_response = "No response received. Please try again."
-    return full_response
 
 # ============================================================
-#  حلقه اصلی (اجرای مداوم)
+#  FastAPI Endpoints
+# ============================================================
+
+@app.post("/baleai")
+async def bale_ai(update: Request):
+    # convert update object from byte to string
+    resp = (await update.body()).decode('utf8').replace("'", '"')
+    # convert resp string to dictionary
+    resp = json.loads(resp)
+
+    # extract text and chat id from resp
+    user_text = resp["message"]["text"]
+    chat_id = resp["message"]["chat"]["id"]
+
+    # create messages object to send to ai
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": user_text}
+    ]
+
+    # send request to ai and get the response 
+    ai_reply = get_ai_response(messages)
+
+    # send the ai reply to bale user and get the result(true/false)
+    result = send_message_to_user(chat_id, ai_reply)
+
+    final_result = {"bale_status": result, "ai_reply": ai_reply}
+    print(final_result)
+ 
+    return final_result
+
+
+# ============================================================
+#  اجرا (با uvicorn)
 # ============================================================
 
 if __name__ == "__main__":
-    print("🤖 Bale bot + Ollama (English only) started...")
-    print("⏳ Waiting for new messages...\n")
-    while True:
-        try:
-            update_id, chat_id, user_text, username, all_updates = get_last_update()
-            if chat_id and user_text:
-                print(f"📩 New message from @{username}: {user_text}")
-                if chat_id not in conversation_histories:
-                    conversation_histories[chat_id] = [
-                        {"role": "system", "content": SYSTEM_PROMPT}
-                    ]
-                conversation_histories[chat_id].append({"role": "user", "content": user_text})
-                print("⏳ Getting response from Ollama...")
-                reply_text = get_full_response(conversation_histories[chat_id])
-                conversation_histories[chat_id].append({"role": "assistant", "content": reply_text})
-                if len(conversation_histories[chat_id]) > 4:
-                    system_msg = conversation_histories[chat_id][0]
-                    conversation_histories[chat_id] = [system_msg] + conversation_histories[chat_id][-3:]
-                if send_message_to_user(chat_id, reply_text):
-                    print("✅ Response sent successfully.")
-                else:
-                    print("❌ Failed to send response.")
-                confirm_updates(all_updates)
-                print(f"✅ {len(all_updates)} messages confirmed.\n")
-            else:
-                pass
-            time.sleep(2)
-        except KeyboardInterrupt:
-            print("\n🛑 Bot stopped by user.")
-            break
-        except Exception as e:
-            print(f"❌ Unexpected error in main loop: {e}")
-            time.sleep(5)
+    # اجرای ربات بله در یک ترد جداگانه
+    # bot_thread = threading.Thread(target=run_bot, daemon=True)
+    # bot_thread.start()
+    
+    # اجرای FastAPI با uvicorn
+    print("🌐 Starting FastAPI server on http://0.0.0.0:8000")
+    uvicorn.run(app, host="0.0.0.0", port=8000)
